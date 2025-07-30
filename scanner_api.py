@@ -3,25 +3,28 @@ from collections import deque, defaultdict
 from datetime import datetime, timezone
 from flask import Flask, jsonify
 import websocket
-import requests
 
 app = Flask(__name__)
-symbol_memory = defaultdict(lambda: deque(maxlen=1800))  # 30 min of 1s ticks
-range_low_map, bounce_map, cooldown_map, decay_cache = {}, {}, {}, {}
+
+symbol_memory = defaultdict(lambda: deque(maxlen=1800))  # 30m per coin
+decay_state = {}            # symbol → dict with tier, bounce, score
+range_low_map = {}
+bounce_timer = {}
+lock = threading.Lock()
 
 def utc_now(): return datetime.now(timezone.utc).isoformat()
 
+# === WebSocket Feed ===
 def on_message(ws, message):
     try:
-        all_tickers = json.loads(message)
-        for entry in all_tickers:
+        tickers = json.loads(message)
+        for entry in tickers:
             symbol = entry["s"].lower()
             if not symbol.endswith("usdt") or "perp" in symbol:
                 continue
             price = float(entry["c"])
             symbol_memory[symbol].append((time.time(), price))
-    except:
-        pass
+    except: pass
 
 def start_websocket():
     url = "wss://stream.binance.com:9443/ws/!ticker@arr"
@@ -31,95 +34,93 @@ def start_websocket():
     )
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
-start_websocket()
-
+# === RSI + Decay Evaluator ===
 def estimate_rsi(prices):
     gains, losses = [], []
     for i in range(1, len(prices)):
         delta = prices[i] - prices[i-1]
-        if delta >= 0: gains.append(delta)
-        else: losses.append(-delta)
+        (gains if delta >= 0 else losses).append(abs(delta))
     avg_gain = sum(gains[-14:]) / 14 if gains else 0.00001
     avg_loss = sum(losses[-14:]) / 14 if losses else 0.00001
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def detect_decay(symbol):
+def evaluate_symbol(symbol):
     memory = list(symbol_memory[symbol])
     if len(memory) < 180:
         return None
+
     prices = [p for _, p in memory[-300:]]
     now_price = prices[-1]
     high, low = max(prices), min(prices)
-    vol_range = (high - low) / low * 100
-    if vol_range > 0.8:
-        return None
+    vol = (high - low) / low * 100
+    if vol > 0.8: return None
     rsi = estimate_rsi(prices)
-    if not (47 <= rsi <= 53):
-        return None
+    if not (47 <= rsi <= 53): return None
     wick_hits = sum(1 for p in prices if abs(p - low)/low < 0.001)
-    if wick_hits < 3:
-        return None
-    decay_score = round(1.0 - (vol_range / 0.8), 3)
+    if wick_hits < 3: return None
+
+    decay_score = round(1.0 - (vol / 0.8), 3)
     range_low_map[symbol] = low
+
+    bounce = False
+    if now_price >= low * 1.0005:
+        t_now = time.time()
+        last = bounce_timer.get(symbol, 0)
+        if t_now - last > 3:
+            bounce_timer[symbol] = t_now
+            bounce = True
+
+    tier = 1 if bounce else 2 if decay_score > 0.85 else 3 if decay_score > 0.75 else None
+    if tier is None: return None
+
     return {
         "symbol": symbol.upper(),
         "decay_score": decay_score,
-        "range_low": low,
-        "last_price": now_price
+        "range_low": round(low, 8),
+        "last_price": round(now_price, 8),
+        "bounce_ready": bounce,
+        "tier": tier,
+        "timestamp": utc_now()
     }
 
-def detect_bounce(symbol):
-    if symbol not in range_low_map:
-        return False
-    price = symbol_memory[symbol][-1][1]
-    low = range_low_map[symbol]
-    if price >= low * 1.0005:
-        t_now = time.time()
-        if bounce_map.get(symbol) is None or t_now - bounce_map[symbol] > 3:
-            bounce_map[symbol] = t_now
-            return True
-    return False
+# === Continuous Decay Scan ===
+def decay_loop():
+    while True:
+        with lock:
+            for symbol in list(symbol_memory.keys()):
+                result = evaluate_symbol(symbol)
+                if result:
+                    decay_state[symbol] = result
+                elif symbol in decay_state:
+                    del decay_state[symbol]
+        time.sleep(1)
 
+# === API Endpoints ===
 @app.route("/range_candidates")
 def range_candidates():
-    results = []
-    t_now = time.time()
-    for symbol in symbol_memory:
-        if cooldown_map.get(symbol, 0) > t_now:
-            continue
-        decay = decay_cache.get(symbol)
-        if decay is None or t_now - decay.get("timestamp", 0) > 5:
-            d = detect_decay(symbol)
-            if d:
-                d["timestamp"] = t_now
-                decay_cache[symbol] = d
-            else:
-                decay_cache[symbol] = {"timestamp": t_now}
-                continue
-        d = decay_cache[symbol]
-        if "symbol" not in d:
-            continue
-        ready = detect_bounce(symbol)
-        if ready:
-            cooldown_map[symbol] = t_now + 15
-        results.append({
-            "symbol": d["symbol"],
-            "decay_score": d["decay_score"],
-            "range_low": round(d["range_low"], 8),
-            "last_price": round(d["last_price"], 8),
-            "bounce_ready": ready,
-            "timestamp": utc_now()
-        })
-    return jsonify(sorted(results, key=lambda x: -x["decay_score"])[:10])
+    with lock:
+        return jsonify(
+            sorted(list(decay_state.values()), key=lambda x: (-x["tier"], -x["decay_score"]))[:10]
+        )
 
 @app.route("/status")
 def status():
-    return jsonify({
-        "loaded_symbols": len(symbol_memory),
-        "memory_ready": sum(1 for s in symbol_memory if len(symbol_memory[s]) > 180),
-        "timestamp": utc_now()
-    })
+    with lock:
+        t1 = sum(1 for v in decay_state.values() if v["tier"] == 1)
+        t2 = sum(1 for v in decay_state.values() if v["tier"] == 2)
+        t3 = sum(1 for v in decay_state.values() if v["tier"] == 3)
+        return jsonify({
+            "symbols_loaded": len(symbol_memory),
+            "symbols_active": len(decay_state),
+            "tier_1": t1,
+            "tier_2": t2,
+            "tier_3": t3,
+            "timestamp": utc_now()
+        })
 
+# === Launch ===
 if __name__ == "__main__":
+    start_websocket()
+    threading.Thread(target=decay_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8000)
