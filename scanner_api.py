@@ -1,4 +1,4 @@
-import json, threading, time
+import json, threading, time, os
 from collections import deque, defaultdict
 from datetime import datetime, timezone
 from flask import Flask, jsonify
@@ -6,13 +6,38 @@ import websocket
 
 app = Flask(__name__)
 
-symbol_memory = defaultdict(lambda: deque(maxlen=1800))  # 30m per coin
-decay_state = {}            # symbol → dict with tier, bounce, score
+symbol_memory = defaultdict(lambda: deque(maxlen=1800))  # 30m of 1s data
+decay_state = {}            # symbol → tier, score, bounce
 range_low_map = {}
 bounce_timer = {}
 lock = threading.Lock()
+DECAY_STATE_PATH = "/tmp/decay_state.json"
 
 def utc_now(): return datetime.now(timezone.utc).isoformat()
+
+# === Load + Save State ===
+def load_saved_decay():
+    global decay_state
+    try:
+        if os.path.exists(DECAY_STATE_PATH):
+            with open(DECAY_STATE_PATH, "r") as f:
+                decay_state.update(json.load(f))
+            print(f"✅ decay_state loaded from disk: {len(decay_state)} symbols")
+    except Exception as e:
+        print("load_saved_decay ERROR:", e)
+
+def save_decay_state():
+    try:
+        with lock:
+            with open(DECAY_STATE_PATH, "w") as f:
+                json.dump(decay_state, f)
+    except Exception as e:
+        print("save_decay_state ERROR:", e)
+
+def auto_save_loop():
+    while True:
+        save_decay_state()
+        time.sleep(5)
 
 # === WebSocket Feed ===
 def on_message(ws, message):
@@ -50,13 +75,22 @@ def evaluate_symbol(symbol):
     if len(memory) < 180:
         return None
 
+    # Movement pre-filter
+    recent = memory[-10:] if len(memory) >= 10 else memory
+    prices = [p for _, p in recent]
+    if len(prices) < 2:
+        return None
+    low10, high10 = min(prices), max(prices)
+    if low10 == 0 or ((high10 - low10) / low10 * 100) < 0.1:
+        return None
+
     prices = [p for _, p in memory[-300:]]
     now_price = prices[-1]
     high, low = max(prices), min(prices)
     vol = (high - low) / low * 100
     if vol > 0.8: return None
     rsi = estimate_rsi(prices)
-    if not (47 <= rsi <= 53): return None
+    if not (48 <= rsi <= 52): return None
     wick_hits = sum(1 for p in prices if abs(p - low)/low < 0.001)
     if wick_hits < 3: return None
 
@@ -64,7 +98,7 @@ def evaluate_symbol(symbol):
     range_low_map[symbol] = low
 
     bounce = False
-    if now_price >= low * 1.0005:
+    if now_price >= low * 1.0001:
         t_now = time.time()
         last = bounce_timer.get(symbol, 0)
         if t_now - last > 3:
@@ -121,6 +155,8 @@ def status():
 
 # === Launch ===
 if __name__ == "__main__":
+    load_saved_decay()
     start_websocket()
     threading.Thread(target=decay_loop, daemon=True).start()
+    threading.Thread(target=auto_save_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8000)
