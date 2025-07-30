@@ -1,131 +1,132 @@
-# scanner_api.py
-
-import asyncio
-import json
+import json, threading, time
 from collections import deque, defaultdict
 from datetime import datetime, timezone
+from flask import Flask, jsonify
+import websocket
+import requests
 
-import websockets
-import uvicorn
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import aiohttp
+app = Flask(__name__)
+symbol_memory = defaultdict(lambda: deque(maxlen=1800))  # 30 min of 1s ticks
+range_low_map = {}
+bounce_map = {}
+cooldown_map = {}
+decay_cache = {}
 
-# ---------------- Config ---------------- #
-MIN_PRICE = 0.002
-MIN_VOLUME = 3_000_000
-MEMORY_SECONDS = 3600
-MIN_MEMORY_REQUIRED = 60  # Minimum 60 seconds of memory
-SCAN_INTERVAL = 1  # seconds
-price_memory = defaultdict(lambda: deque(maxlen=MEMORY_SECONDS))
-coin_meta = {}  # symbol → {"volume": float, "price": float}
-top_10_snapshot = {"timestamp": "", "top_10": []}
+def utc_now(): return datetime.now(timezone.utc).isoformat()
 
-# ---------------- FastAPI App ---------------- #
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # You may restrict this later
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def on_message(ws, message):
+    data = json.loads(message)
+    if "data" not in data or "s" not in data["data"]:
+        return
+    symbol = data["data"]["s"].lower()
+    if not symbol.endswith("usdt") or "perp" in symbol:
+        return
+    try:
+        price = float(data["data"]["c"])
+        symbol_memory[symbol].append((time.time(), price))
+    except:
+        pass
 
-def now():
-    return datetime.now(timezone.utc)
+def start_websocket():
+    url = "wss://stream.binance.com:9443/ws/!ticker@arr"
+    ws = websocket.WebSocketApp(
+        url, on_message=on_message, on_error=lambda *a: None, on_close=lambda *a: None)
+    threading.Thread(target=ws.run_forever, daemon=True).start()
 
-def pct_change(old, new):
-    return ((new - old) / old) * 100 if old else 0
+start_websocket()
 
-def score_consistency(symbol):
-    mem = list(price_memory[symbol])[-15:]
-    if len(mem) < 5: return 0
-    ups = sum(1 for i in range(1, len(mem)) if mem[i][1] > mem[i-1][1])
-    up_ratio = ups / (len(mem) - 1)
-    prices = [p for _, p in mem]
-    drawdown = max(prices) - min(prices)
-    penalty = drawdown / prices[-1] if prices[-1] > 0 else 0
-    return round((up_ratio * 2.0) - penalty, 3)
+def estimate_rsi(prices):
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        delta = prices[i] - prices[i-1]
+        if delta >= 0: gains.append(delta)
+        else: losses.append(-delta)
+    avg_gain = sum(gains[-14:]) / 14 if gains else 0.00001
+    avg_loss = sum(losses[-14:]) / 14 if losses else 0.00001
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-async def preload_meta():
-    url = "https://api.binance.com/api/v3/ticker/24hr"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
-            for d in data:
-                sym = d["symbol"].lower()
-                if sym.endswith("usdt"):
-                    coin_meta[sym] = {
-                        "volume": float(d.get("quoteVolume", 0)),
-                        "price": float(d.get("lastPrice", 0))
-                    }
+def detect_decay(symbol):
+    memory = list(symbol_memory[symbol])
+    if len(memory) < 180:
+        return None  # not enough data
 
-async def scanner_loop():
-    global top_10_snapshot
-    await preload_meta()
-    uri = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
+    prices = [p for _, p in memory[-300:]]  # last 5m
+    now_price = prices[-1]
+    high, low = max(prices), min(prices)
+    vol_range = (high - low) / low * 100
 
-    async with websockets.connect(uri) as ws:
-        while True:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=5)
-                tick_data = json.loads(raw)
-                timestamp = now()
-                candidates = []
+    if vol_range > 0.8:
+        return None
 
-                for item in tick_data:
-                    symbol = item["s"].lower()
-                    if not symbol.endswith("usdt"): continue
-                    price = float(item["c"])
-                    if price < MIN_PRICE: continue
+    rsi = estimate_rsi(prices)
+    if not (47 <= rsi <= 53):
+        return None
 
-                    meta = coin_meta.get(symbol, {})
-                    vol = meta.get("volume", 0)
-                    if vol < MIN_VOLUME: continue
+    # wick rejection near range low
+    wick_hits = sum(1 for p in prices if abs(p - low)/low < 0.001)
+    if wick_hits < 3:
+        return None
 
-                    memory = price_memory[symbol]
-                    memory.append((timestamp, price))
-                    if len(memory) < MIN_MEMORY_REQUIRED:
-                        continue
+    decay_score = round(1.0 - (vol_range / 0.8), 3)  # closer to 1 = flatter
+    range_low_map[symbol] = low
+    return {
+        "symbol": symbol.upper(),
+        "decay_score": decay_score,
+        "range_low": low,
+        "last_price": now_price
+    }
 
-                    price_now = memory[-1][1]
-                    price_past = memory[0][1]
-                    change_1h = pct_change(price_past, price_now)
-                    velocity_1s = pct_change(memory[-2][1], price_now) if len(memory) > 2 else 0
-                    movement_score = change_1h + (velocity_1s * 5)
-                    consistency = score_consistency(symbol)
-                    total_score = round(movement_score + consistency, 3)
+def detect_bounce(symbol):
+    if symbol not in range_low_map:
+        return False
+    price = symbol_memory[symbol][-1][1]
+    low = range_low_map[symbol]
+    if price >= low * 1.0005:
+        t_now = time.time()
+        if bounce_map.get(symbol) is None or t_now - bounce_map[symbol] > 3:
+            bounce_map[symbol] = t_now
+            return True
+    return False
 
-                    candidates.append({
-                        "symbol": symbol,
-                        "price": round(price, 6),
-                        "change_1h": round(change_1h, 3),
-                        "velocity": round(velocity_1s, 3),
-                        "consistency": consistency,
-                        "score": total_score
-                    })
+@app.route("/range_candidates")
+def range_candidates():
+    results = []
+    t_now = time.time()
 
-                top_10 = sorted(candidates, key=lambda x: x["score"], reverse=True)[:10]
-                top_10_snapshot = {
-                    "timestamp": now().isoformat(),
-                    "top_10": top_10
-                }
+    for symbol in symbol_memory:
+        # Cooldown filter
+        if cooldown_map.get(symbol, 0) > t_now:
+            continue
 
-                await asyncio.sleep(SCAN_INTERVAL)
+        decay = decay_cache.get(symbol)
+        if decay is None or t_now - decay.get("timestamp", 0) > 5:
+            d = detect_decay(symbol)
+            if d:
+                d["timestamp"] = t_now
+                decay_cache[symbol] = d
+            else:
+                decay_cache[symbol] = {"timestamp": t_now}
+                continue
 
-            except (asyncio.TimeoutError, websockets.ConnectionClosed):
-                print("WebSocket disconnected. Reconnecting...")
-                return await scanner_loop()
+        d = decay_cache[symbol]
+        if "symbol" not in d:
+            continue
 
-# ---------------- FastAPI Endpoints ---------------- #
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(scanner_loop())
+        ready = detect_bounce(symbol)
+        if ready:
+            cooldown_map[symbol] = t_now + 15  # 15s cooldown per coin
 
-@app.get("/top10")
-def get_top_10():
-    return top_10_snapshot
+        results.append({
+            "symbol": d["symbol"],
+            "decay_score": d["decay_score"],
+            "range_low": round(d["range_low"], 8),
+            "last_price": round(d["last_price"], 8),
+            "bounce_ready": ready,
+            "timestamp": utc_now()
+        })
 
-# ---------------- Main Entry ---------------- #
+    return jsonify(sorted(results, key=lambda x: -x["decay_score"])[:10])
+
 if __name__ == "__main__":
-    uvicorn.run("scanner_api:app", host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=8000)
