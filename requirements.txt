@@ -1,4 +1,3 @@
-fastapi
-uvicorn
-websockets
-aiohttp
+flask
+websocket-client
+requests
